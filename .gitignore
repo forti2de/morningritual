@@ -172,3 +172,320 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+#!/usr/bin/env python3
+"""
+Самостоятельный скрипт для запуска Telegram бота.
+Создает отдельное окружение для бота, избегая конфликтов с веб-сервером.
+"""
+import os
+import sys
+import time
+import logging
+import asyncio
+from datetime import datetime, timezone, timedelta
+from telegram import Update, Bot
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, 
+    filters, ContextTypes, CallbackContext
+)
+
+# Импортируем необходимые модули
+import config
+import messages
+from models import get_user_status, update_user_status
+from bot_settings import settings_command, get_settings_handlers
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Включаем более подробное логирование для дебага
+# Создаем обработчик для вывода в файл
+file_handler = logging.FileHandler('telegram_debug.log')
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+logger.setLevel(logging.DEBUG)
+
+# Сообщаем о старте
+logger.info("====== ЗАПУСК БОТА В РЕЖИМЕ ТЕСТИРОВАНИЯ ======")
+logger.info(f"Бот запущен с токеном: {config.TOKEN[:5]}...[СКРЫТО]")
+logger.info(f"Бот настроен для работы с несколькими пользователями")
+logger.info(f"Московское время: {datetime.now(config.TIMEZONE)}")
+
+# Установка переменной окружения для бота
+os.environ["RUN_BOT"] = "true"
+
+# Обработчики команд
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка команды /start."""
+    user = update.effective_user
+    logger.info(f"Получена команда /start от пользователя {user.id}")
+    
+    # Получаем или создаем статус пользователя
+    user_status = get_user_status(user.id)
+    
+    # Отправляем приветственное сообщение
+    welcome_message = messages.get_welcome()
+    await update.message.reply_text(welcome_message)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка команды /status."""
+    user = update.effective_user
+    logger.info(f"Получена команда /status от пользователя {user.id}")
+    
+    # Получаем статус пользователя
+    user_status = get_user_status(user.id)
+    
+    # Формируем сообщение о текущем статусе
+    status_message = messages.get_status(
+        user_status.streak, 
+        user_status.last_checkin
+    )
+    
+    # Отправляем сообщение
+    await update.message.reply_text(status_message)
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка команды /reset для сброса счетчика дней."""
+    user = update.effective_user
+    logger.info(f"Получена команда /reset от пользователя {user.id}")
+    
+    # Сбрасываем счетчик
+    update_user_status(user.id, streak=0)
+    
+    # Сообщаем об успешном сбросе
+    await update.message.reply_text("Счетчик дней сброшен до 0.")
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка обычных сообщений."""
+    user = update.effective_user
+    message_text = update.message.text
+    logger.info(f"Получено сообщение от пользователя {user.id}: {message_text}")
+    
+    # Проверяем, является ли сообщение чек-ином
+    now = datetime.now(config.TIMEZONE)
+    mission_time = now.replace(
+        hour=config.MISSION_TIME[0], 
+        minute=config.MISSION_TIME[1], 
+        second=0, 
+        microsecond=0
+    )
+    
+    # Допустимый интервал для чек-ина после отправки задания
+    check_end_time = mission_time + timedelta(minutes=config.CHECK_WINDOW)
+    
+    # Если мы в окне проверки и это похоже на отчет о выполнении задания
+    if now < check_end_time and now >= mission_time and len(message_text) > 5:
+        user_status = get_user_status(user.id)
+        
+        # Проверяем, не чекинился ли пользователь уже сегодня
+        if user_status.last_checkin and user_status.last_checkin.date() == now.date():
+            await update.message.reply_text("Вы уже отметились сегодня!")
+        else:
+            # Обновляем статус и счетчик дней
+            new_streak = user_status.streak + 1
+            update_user_status(user.id, streak=new_streak, last_checkin=now)
+            
+            # Отправляем сообщение об успешном чек-ине
+            success_message = messages.get_success(new_streak)
+            await update.message.reply_text(success_message)
+            logger.info(f"Успешный чек-ин от пользователя {user.id}. Новая серия: {new_streak}")
+    else:
+        # Это не чек-ин, просто отвечаем общим сообщением
+        await update.message.reply_text(
+            "Для проверки вашего статуса используйте /status\n"
+            "Для сброса счетчика дней используйте /reset\n"
+            "Для настройки бота используйте /settings"
+        )
+
+async def error_handler(update, context):
+    """Обработка ошибок."""
+    logger.error(f"Ошибка: {context.error}")
+
+async def check_morning_schedule():
+    """Проверка и выполнение утренних задач по расписанию."""
+    bot = Bot(token=config.TOKEN)
+    
+    # Получаем все активные сессии SQLAlchemy
+    from sqlalchemy.orm import sessionmaker
+    from models import engine, UserStatus
+    
+    # Создаем фабрику сессий
+    Session = sessionmaker(bind=engine)
+    
+    # Кеширование для предотвращения повторных отправок
+    last_warning_sent = {}
+    last_mission_sent = {}
+    last_check_done = {}
+    
+    while True:
+        try:
+            # Получаем текущее время в UTC
+            now_utc = datetime.now(timezone.utc)
+            
+            # Получаем список всех пользователей из базы данных
+            session = Session()
+            try:
+                users = session.query(UserStatus).all()
+                user_ids = [user.user_id for user in users]
+            finally:
+                session.close()
+            
+            logger.info(f"Проверка расписания для {len(user_ids)} пользователей")
+            
+            # Проверяем для каждого пользователя
+            for user_id in user_ids:
+                try:
+                    # Получаем настройки пользователя
+                    user_status = get_user_status(user_id)
+                    
+                    # Создаем часовой пояс пользователя
+                    user_tz = timezone(timedelta(hours=user_status.timezone_offset))
+                    now = now_utc.astimezone(user_tz)
+                    
+                    # Разбираем время из настроек пользователя
+                    warning_hour, warning_minute = map(int, user_status.warning_time.split(':'))
+                    mission_hour, mission_minute = map(int, user_status.mission_time.split(':'))
+                    check_hour, check_minute = map(int, user_status.check_time.split(':'))
+                    
+                    # Устанавливаем времена уведомлений в соответствии с настройками пользователя
+                    warning_time = now.replace(
+                        hour=warning_hour, 
+                        minute=warning_minute, 
+                        second=0, 
+                        microsecond=0
+                    )
+                    
+                    mission_time = now.replace(
+                        hour=mission_hour, 
+                        minute=mission_minute, 
+                        second=0, 
+                        microsecond=0
+                    )
+                    
+                    check_time = now.replace(
+                        hour=check_hour, 
+                        minute=check_minute, 
+                        second=0, 
+                        microsecond=0
+                    )
+                    
+                    # Проверяем, не чекинился ли пользователь уже сегодня
+                    already_checked_in = (
+                        user_status.last_checkin and 
+                        user_status.last_checkin.date() == now.date()
+                    )
+                    
+                    # Ключи для кеша отправленных сообщений
+                    warning_key = f"{user_id}_{now.date().isoformat()}"
+                    mission_key = warning_key
+                    check_key = warning_key
+                    
+                    # Отправляем предупреждение перед основным сообщением
+                    time_diff_warning = abs((now - warning_time).total_seconds())
+                    if time_diff_warning < 30 and not already_checked_in and warning_key not in last_warning_sent:
+                        # Отправляем предупреждение только если еще не чекинились сегодня и не отправляли сегодня
+                        warning_message = messages.get_warning(user_status)
+                        await bot.send_message(chat_id=user_id, text=warning_message)
+                        logger.info(f"Отправлено предупреждение пользователю {user_id}")
+                        # Отмечаем что предупреждение отправлено
+                        last_warning_sent[warning_key] = True
+                    
+                    # Отправляем утреннее задание в запланированное время
+                    time_diff_mission = abs((now - mission_time).total_seconds())
+                    if time_diff_mission < 30 and not already_checked_in and mission_key not in last_mission_sent:
+                        # Отправляем задание только если еще не чекинились сегодня и не отправляли сегодня
+                        mission_message = messages.get_morning_mission(user_status)
+                        await bot.send_message(chat_id=user_id, text=mission_message)
+                        logger.info(f"Отправлено задание пользователю {user_id}")
+                        # Отмечаем что задание отправлено
+                        last_mission_sent[mission_key] = True
+                    
+                    # Проверяем, выполнено ли задание, в запланированное время
+                    time_diff_check = abs((now - check_time).total_seconds())
+                    if time_diff_check < 30 and not already_checked_in and check_key not in last_check_done:
+                        # Если время проверки и пользователь не чекинился сегодня
+                        # Сбрасываем счетчик дней
+                        update_user_status(user_id, streak=0)
+                        # Отправляем сообщение о сбросе
+                        failure_message = messages.get_failure(user_status)
+                        await bot.send_message(chat_id=user_id, text=failure_message)
+                        logger.info(f"Счетчик дней сброшен для пользователя {user_id}")
+                        # Отмечаем что проверка выполнена
+                        last_check_done[check_key] = True
+                
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке пользователя {user_id}: {e}")
+            
+            # Очищаем старые записи из кеша (старше 1 дня)
+            yesterday = (now_utc - timedelta(days=1)).date().isoformat()
+            for cache in [last_warning_sent, last_mission_sent, last_check_done]:
+                for key in list(cache.keys()):
+                    if key.split('_')[1] < yesterday:
+                        del cache[key]
+            
+            # Ждем 10 секунд перед следующей проверкой
+            await asyncio.sleep(10)
+            
+        except Exception as e:
+            logger.error(f"Ошибка в проверке расписания: {e}")
+            # При ошибке ждем 30 секунд
+            await asyncio.sleep(30)
+
+async def main():
+    """Запуск бота асинхронно."""
+    # Создаем объект приложения
+    application = Application.builder().token(config.TOKEN).build()
+    
+    # Регистрируем обработчики
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("reset", reset_command))
+    
+    # Регистрируем обработчик команды настроек
+    application.add_handler(CommandHandler("settings", settings_command))
+    
+    # Регистрируем обработчики для меню настроек
+    settings_handlers = get_settings_handlers()
+    application.add_handler(settings_handlers)
+    
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    # Регистрируем обработчик ошибок
+    application.add_error_handler(error_handler)
+    
+    # Запускаем проверку расписания в отдельном задании
+    asyncio.create_task(check_morning_schedule())
+    
+    # Запускаем бота
+    logger.info("Telegram бот запущен, ожидаем сообщений...")
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def run_bot():
+    """Запуск бота с учетом правильной инициализации asyncio."""
+    logger.info("Запуск Telegram бота в отдельном процессе...")
+    
+    # Использование thread-safe подхода из simple_bot.py
+    loop = None
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен по запросу пользователя")
+    except Exception as e:
+        logger.error(f"Критическая ошибка при запуске бота: {e}")
+        # При критической ошибке ждем немного и перезапускаем
+        time.sleep(5)
+        run_bot()  # Рекурсивный перезапуск
+    finally:
+        if loop is not None and not loop.is_closed():
+            loop.close()
+
+if __name__ == "__main__":
+    # Запускаем бота
+    run_bot()
